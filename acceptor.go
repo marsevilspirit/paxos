@@ -2,7 +2,9 @@ package paxos
 
 import (
 	"fmt"
+	"log"
 	"net"
+	"net/rpc"
 )
 
 type Acceptor struct {
@@ -18,6 +20,40 @@ type Acceptor struct {
 	acceptedValue any
 
 	learners []int
+}
+
+func newAcceptor(id int, learners []int) *Acceptor {
+	acceptor := &Acceptor{
+		id:       id,
+		learners: learners,
+	}
+	acceptor.server()
+	return acceptor
+}
+
+func (a *Acceptor) server() {
+	rpcs := rpc.NewServer()
+	rpcs.Register(a)
+	addr := fmt.Sprintf(":%d", a.id)
+	l, e := net.Listen("tcp", addr)
+	if e != nil {
+		log.Fatal("listen error:", e)
+	}
+	a.lis = l
+
+	go func() {
+		for {
+			conn, err := a.lis.Accept()
+			if err != nil {
+				continue
+			}
+			go rpcs.ServeConn(conn)
+		}
+	}()
+}
+
+func (a *Acceptor) close() {
+	a.lis.Close()
 }
 
 func (a *Acceptor) Perpare(args *MsgArgs, reply *MsgReply) error {
