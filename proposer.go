@@ -1,85 +1,131 @@
 package paxos
 
-import "fmt"
+import "time"
 
-type Proposer struct {
-	// server id
+// proposer 提议者状态机
+type proposer struct {
 	id int
 
+	// 提案值
+	value any
+
+	// 网络接口
+	net network
+
+	// 接受者ID列表
+	acceptorIds []int
+
+	// 当前轮次
 	round int
-
-	// propose number
-	number int
-
-	acceptors []int
 }
 
-func (p *Proposer) propose(v any) any {
+// newProposer 创建新的提议者
+func newProposer(id int, value any, net network, acceptorIds ...int) *proposer {
+	return &proposer{
+		id:          id,
+		value:       value,
+		net:         net,
+		acceptorIds: acceptorIds,
+		round:       0,
+	}
+}
+
+// run 启动提议者
+func (p *proposer) run() {
 	p.round++
-	p.number = p.proposalNumber()
+	number := p.proposalNumber()
 
-	// phase 1
-	prepareCount := 0
+	// Phase 1: Prepare
+	prepareResponses := p.prepare(number)
+
+	// 检查是否获得多数派承诺
+	if len(prepareResponses) < p.majority() {
+		return // 未获得多数派支持
+	}
+
+	// 找到最高编号的已接受值
 	maxNumber := 0
-	for _, aid := range p.acceptors {
-		args := MsgArgs{
-			Number: p.number,
+	for _, resp := range prepareResponses {
+		if resp.Ok && resp.Number > maxNumber {
+			maxNumber = resp.Number
+			p.value = resp.Value
+		}
+	}
+
+	// Phase 2: Accept
+	acceptResponses := p.accept(number)
+
+	// 检查是否获得多数派接受
+	if len(acceptResponses) < p.majority() {
+		return // 未获得多数派接受
+	}
+}
+
+// prepare 准备阶段
+func (p *proposer) prepare(number int) []*Message {
+	var responses []*Message
+
+	// 发送Prepare消息给所有接受者
+	for _, acceptorId := range p.acceptorIds {
+		msg := &Message{
+			Type:   Prepare,
 			From:   p.id,
-			To:     aid,
-		}
-		reply := new(MsgReply)
-		err := call(fmt.Sprintf("127.0.0.1:%d", aid), "Acceptor.Prepare", args, reply)
-		if !err {
-			continue
+			To:     acceptorId,
+			Number: number,
 		}
 
-		if reply.Ok {
-			prepareCount++
-			if reply.Number > maxNumber {
-				maxNumber = reply.Number
-				v = reply.Value
-			}
-		}
-
-		if prepareCount == p.majority() {
-			break
-		}
+		p.net.send(msg)
 	}
 
-	// phase 2
-	acceptCount := 0
-	if prepareCount >= p.majority() {
-		for _, aid := range p.acceptors {
-			args := MsgArgs{
-				Number: p.number,
-				Value:  v,
-				From:   p.id,
-				To:     aid,
-			}
-			reply := new(MsgReply)
-			ok := call(fmt.Sprintf("127.0.0.1:%d", aid), "Acceptor.Accept", args, reply)
-			if !ok {
-				continue
-			}
-
-			if reply.Ok {
-				acceptCount++
+	// 接收响应
+	timeout := 100 * time.Millisecond
+	for i := 0; i < len(p.acceptorIds); i++ {
+		if response, ok := p.net.recv(timeout); ok {
+			if msg, ok := response.(*Message); ok && msg.Type == Promise && msg.Ok {
+				responses = append(responses, msg)
 			}
 		}
 	}
 
-	if acceptCount >= p.majority() {
-		return v
-	}
-	return nil
+	return responses
 }
 
-func (p *Proposer) majority() int {
-	return len(p.acceptors)/2 + 1
+// accept 接受阶段
+func (p *proposer) accept(number int) []*Message {
+	var responses []*Message
+
+	// 发送Accept消息给所有接受者
+	for _, acceptorId := range p.acceptorIds {
+		msg := &Message{
+			Type:   Accept,
+			From:   p.id,
+			To:     acceptorId,
+			Number: number,
+			Value:  p.value,
+		}
+
+		p.net.send(msg)
+	}
+
+	// 接收响应
+	timeout := 100 * time.Millisecond
+	for i := 0; i < len(p.acceptorIds); i++ {
+		if response, ok := p.net.recv(timeout); ok {
+			if msg, ok := response.(*Message); ok && msg.Type == Accept && msg.Ok {
+				responses = append(responses, msg)
+			}
+		}
+	}
+
+	return responses
 }
 
-// 高16位存储轮次信息
-// 低16位存储提议者ID
-func (p *Proposer) proposalNumber() int {
+// majority 计算多数派数量
+func (p *proposer) majority() int {
+	return len(p.acceptorIds)/2 + 1
+}
+
+// proposalNumber 生成提案编号
+func (p *proposer) proposalNumber() int {
 	return p.round<<16 | p.id
 }

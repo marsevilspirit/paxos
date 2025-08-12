@@ -1,94 +1,121 @@
 package paxos
 
-import (
-	"fmt"
-	"log"
-	"net"
-	"net/rpc"
-)
+import "time"
 
-type Acceptor struct {
-	lis net.Listener
-
-	// server id
+// acceptor 接受者状态机
+type acceptor struct {
 	id int
 
-	minProposal int
+	// 状态
+	state AcceptorState
 
-	acceptedNumber int
+	// 网络接口
+	net network
 
-	acceptedValue any
-
-	learners []int
+	// 学习者ID列表
+	learnerIds []int
 }
 
-func newAcceptor(id int, learners []int) *Acceptor {
-	acceptor := &Acceptor{
-		id:       id,
-		learners: learners,
+// newAcceptor 创建新的接受者
+func newAcceptor(id int, net network, learnerIds ...int) *acceptor {
+	return &acceptor{
+		id:         id,
+		net:        net,
+		learnerIds: learnerIds,
+		state: AcceptorState{
+			PromisedNumber: 0,
+			AcceptedNumber: 0,
+			AcceptedValue:  nil,
+		},
 	}
-	acceptor.server()
-	return acceptor
 }
 
-func (a *Acceptor) server() {
-	rpcs := rpc.NewServer()
-	rpcs.Register(a)
-	addr := fmt.Sprintf(":%d", a.id)
-	l, e := net.Listen("tcp", addr)
-	if e != nil {
-		log.Fatal("listen error:", e)
-	}
-	a.lis = l
+// HandlePrepare 处理准备请求
+func (a *acceptor) HandlePrepare(msg *Message) *Message {
+	if msg.Number > a.state.PromisedNumber {
+		// 承诺接受更高编号的提案
+		a.state.PromisedNumber = msg.Number
 
-	go func() {
-		for {
-			conn, err := a.lis.Accept()
-			if err != nil {
-				continue
-			}
-			go rpcs.ServeConn(conn)
+		return &Message{
+			Type:   Promise,
+			From:   a.id,
+			To:     msg.From,
+			Number: a.state.AcceptedNumber,
+			Value:  a.state.AcceptedValue,
+			Ok:     true,
 		}
-	}()
-}
-
-func (a *Acceptor) close() {
-	a.lis.Close()
-}
-
-func (a *Acceptor) Perpare(args *MsgArgs, reply *MsgReply) error {
-	if args.Number > a.minProposal {
-		a.minProposal = args.Number
-		reply.Number = a.acceptedNumber
-		reply.Value = a.acceptedValue
-		reply.Ok = true
-	} else {
-		reply.Ok = false
 	}
-	return nil
+
+	// 拒绝低编号的提案
+	return &Message{
+		Type: Promise,
+		From: a.id,
+		To:   msg.From,
+		Ok:   false,
+	}
 }
 
-func (a *Acceptor) Accept(args *MsgArgs, reply *MsgReply) error {
-	if args.Number >= a.minProposal {
-		a.minProposal = args.Number
-		reply.Number = a.acceptedNumber
-		reply.Value = a.acceptedValue
-		reply.Ok = true
+// HandleAccept 处理接受请求
+func (a *acceptor) HandleAccept(msg *Message) *Message {
+	if msg.Number >= a.state.PromisedNumber {
+		// 接受提案
+		a.state.PromisedNumber = msg.Number
+		a.state.AcceptedNumber = msg.Number
+		a.state.AcceptedValue = msg.Value
 
-		for _, lid := range a.learners {
-			go func(learner int) {
-				addr := fmt.Sprintf("127.0.0.1:%d", learner)
-				args.From = a.id
-				args.To = learner
-				resp := new(MsgReply)
-				ok := call(addr, "Learner.Learn", args, resp)
-				if !ok {
-					return
+		return &Message{
+			Type: Accept,
+			From: a.id,
+			To:   msg.From,
+			Ok:   true,
+		}
+	}
+
+	// 拒绝提案
+	return &Message{
+		Type: Accept,
+		From: a.id,
+		To:   msg.From,
+		Ok:   false,
+	}
+}
+
+// GetState 获取当前状态
+func (a *acceptor) GetState() AcceptorState {
+	return a.state
+}
+
+// GetID 获取接受者ID
+func (a *acceptor) GetID() int {
+	return a.id
+}
+
+// run 启动接受者消息处理循环
+func (a *acceptor) run() {
+	for {
+		if msg, ok := a.net.recv(100 * time.Millisecond); ok {
+			if message, ok := msg.(*Message); ok {
+				switch message.GetType() {
+				case Prepare:
+					response := a.HandlePrepare(message)
+					a.net.send(response)
+				case Accept:
+					response := a.HandleAccept(message)
+					// 通知所有学习者
+					for _, learnerId := range a.learnerIds {
+						learnMsg := &Message{
+							Type:   Accept,
+							From:   a.id,
+							To:     learnerId,
+							Number: message.Number,
+							Value:  message.Value,
+							Ok:     true,
+						}
+						a.net.send(learnMsg)
+					}
+					a.net.send(response)
 				}
-			}(lid)
+			}
 		}
-	} else {
-		reply.Ok = false
 	}
-	return nil
 }
